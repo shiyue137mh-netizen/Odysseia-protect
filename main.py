@@ -21,6 +21,7 @@ from src.database.repositories.user import UserRepository
 from src.services.upload_service import UploadService
 from src.services.download_service import DownloadService
 from src.services.management_service import ManagementService
+from src.services.traceability_service import TraceabilityService
 # from src.services.reaction_wall_service import ReactionWallService
 
 
@@ -64,6 +65,7 @@ class OdysseiaProtect(commands.Bot):
         thread_repo = ThreadRepository()
         resource_repo = ResourceRepository()
         user_repo = UserRepository()
+        self.traceability_service = TraceabilityService.from_environment()
         self.upload_service = UploadService(self, resource_repo, thread_repo, user_repo)
         self.download_service = DownloadService(
             self, resource_repo, thread_repo, user_repo

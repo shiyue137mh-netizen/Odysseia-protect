@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-下载功能的 UI 组件 (View 和 Modal)
-"""
+"""下载资源选择、密码校验与动态溯源告知。"""
 
+from __future__ import annotations
+
+import io
 import logging
 from typing import Sequence
 
@@ -11,45 +12,171 @@ import discord
 from src.database.database import AsyncSessionLocal
 from src.database.models import Resource, UploadMode
 from src.database.repositories.resource import ResourceRepository
+from src.services.traceability_service import TraceabilityUnavailableError
+from src.traceability.watermark import WatermarkError
 
 logger = logging.getLogger(__name__)
 
 
+async def _load_resource(resource_id: int) -> Resource | None:
+    async with AsyncSessionLocal() as session:
+        return await ResourceRepository().get_with_thread(session, id=resource_id)
+
+
+async def _increment_download_count(resource_id: int) -> None:
+    try:
+        async with AsyncSessionLocal() as session:
+            resource = await ResourceRepository().get(session, resource_id)
+            if resource is None:
+                return
+            resource.download_count += 1
+            await session.commit()
+    except Exception as exc:
+        logger.warning("资源 %s 的下载计数更新失败", resource_id, exc_info=exc)
+
+
+async def _send_ephemeral(
+    interaction: discord.Interaction,
+    *,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(content=content, embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            content=content, embed=embed, ephemeral=True
+        )
+
+
+async def _fetch_source_attachment(
+    interaction: discord.Interaction, resource: Resource
+) -> discord.Attachment:
+    channel_id = (
+        resource.thread.warehouse_thread_id or resource.thread.public_thread_id
+    )
+    source_channel = await interaction.client.fetch_channel(channel_id)
+    if not isinstance(source_channel, (discord.TextChannel, discord.Thread)):
+        raise ValueError("资源所在频道不支持读取消息。")
+    source_message = await source_channel.fetch_message(resource.source_message_id)
+    if not source_message.attachments:
+        raise ValueError("源消息中没有附件。")
+    return source_message.attachments[0]
+
+
+async def deliver_resource(
+    interaction: discord.Interaction,
+    *,
+    resource_id: int,
+    trace_confirmed: bool = False,
+) -> None:
+    resource = await _load_resource(resource_id)
+    if resource is None:
+        await _send_ephemeral(
+            interaction, content="❌ 找不到所选资源，它可能已被删除。"
+        )
+        return
+    if resource.trace_enabled and not trace_confirmed:
+        await _send_ephemeral(interaction, content="❌ 请先确认动态溯源告知。")
+        return
+
+    if resource.trace_enabled and not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        attachment = await _fetch_source_attachment(interaction, resource)
+        if not resource.trace_enabled:
+            fresh_url = attachment.url
+            embed = discord.Embed(
+                title="🔗 下载与导入",
+                description=f"[打开下载链接]({fresh_url})",
+                color=discord.Color.green(),
+            )
+            embed.add_field(
+                name="📋 SillyTavern 快速导入链接",
+                value=f"`{fresh_url}`",
+                inline=False,
+            )
+            await _send_ephemeral(interaction, embed=embed)
+        else:
+            source_data = await attachment.read()
+            traceability_service = getattr(
+                interaction.client, "traceability_service", None
+            )
+            if traceability_service is None:
+                raise TraceabilityUnavailableError("Bot 未加载动态溯源服务。")
+            personalized = await traceability_service.personalize(
+                source_data,
+                filename=resource.filename or attachment.filename,
+                user_id=interaction.user.id,
+                public_thread_id=resource.thread.public_thread_id,
+                resource_id=resource.id,
+            )
+            filesize_limit = getattr(interaction, "filesize_limit", None)
+            if filesize_limit and len(personalized.data) > filesize_limit:
+                raise ValueError("个性化文件超过当前 Discord 交互允许的附件大小。")
+
+            # ponytail: 首轮生产试验使用 Ephemeral 附件交付；验证稳定后，
+            # 将这里替换为 VPS 短时签名 URL，并保留当前生成服务不变。
+            await interaction.followup.send(
+                content=(
+                    "✅ 已生成仅供本次下载的个性化角色卡。\n"
+                    "溯源标记仅在发现外部泄露样本后用于被动核验，Bot 不读取本地文件。"
+                ),
+                file=discord.File(
+                    io.BytesIO(personalized.data), filename=personalized.filename
+                ),
+                ephemeral=True,
+            )
+        await _increment_download_count(resource.id)
+    except (WatermarkError, TraceabilityUnavailableError, ValueError) as exc:
+        logger.warning("资源 %s 的下载生成失败: %s", resource.id, exc)
+        await _send_ephemeral(interaction, content=f"❌ 无法生成下载文件：{exc}")
+    except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
+        logger.error(
+            "资源 %s 的 Discord 文件读取或发送失败", resource.id, exc_info=exc
+        )
+        await _send_ephemeral(
+            interaction,
+            content="❌ 获取或发送资源失败，请稍后重试并联系管理员。",
+        )
+    except Exception as exc:
+        logger.error("资源 %s 的下载流程发生未知错误", resource.id, exc_info=exc)
+        await _send_ephemeral(
+            interaction, content="❌ 下载流程发生内部错误，请稍后重试。"
+        )
+
+
 class ResourceSelectView(discord.ui.View):
-    """
-    一个包含版本选择下拉菜单的交互式视图。
-    """
+    """一个包含版本选择下拉菜单的交互式视图。"""
 
     def __init__(self, resources: Sequence[Resource]):
-        # timeout=None 让视图永久有效，不会在几分钟后禁用
         super().__init__(timeout=None)
-
-        # 将 Resource 对象列表添加到下拉菜单中
         self.add_item(self.ResourceSelect(resources))
 
     class ResourceSelect(discord.ui.Select):
-        """
-        继承自 discord.ui.Select 的自定义下拉菜单。
-        """
-
         def __init__(self, resources: Sequence[Resource]):
             options = []
-            # Discord 的下拉菜单最多只能有 25 个选项
             for resource in resources[:25]:
                 mode_icon = "🔒" if resource.upload_mode == UploadMode.SECURE else "📄"
-                # 为每个资源创建一个选项
-                option = discord.SelectOption(
-                    label=f"{mode_icon} 版本: {resource.version_info or '未命名'}",
-                    description=f"文件名: {resource.filename or 'N/A'}",
-                    value=str(resource.id),  # 将数据库主键ID作为值，方便回调时查找
+                trace_icon = " · 溯源" if resource.trace_enabled else ""
+                filename = resource.filename or "N/A"
+                options.append(
+                    discord.SelectOption(
+                        label=(
+                            f"{mode_icon} 版本: {resource.version_info or '未命名'}"
+                        ),
+                        description=f"文件名: {filename}{trace_icon}"[:100],
+                        value=str(resource.id),
+                    )
                 )
-                options.append(option)
 
-            # 如果没有可用的选项，创建一个禁用的占位符
             if not options:
                 options.append(
                     discord.SelectOption(
-                        label="没有找到任何受保护的资源", value="disabled", default=True
+                        label="没有找到任何受保护的资源",
+                        value="disabled",
+                        default=True,
                     )
                 )
 
@@ -58,176 +185,96 @@ class ResourceSelectView(discord.ui.View):
                 min_values=1,
                 max_values=1,
                 options=options,
-                disabled=not options or options[0].value == "disabled",
+                disabled=options[0].value == "disabled",
             )
 
         async def callback(self, interaction: discord.Interaction):
-            """
-            当用户在下拉菜单中做出选择时，这个回调函数会被触发。
-            现在它会动态获取一个全新的、有时效性的下载链接。
-            """
-            selected_resource_id = int(self.values[0])
-
-            async with AsyncSessionLocal() as session:
-                resource_repo = ResourceRepository()
-                # 使用 joinedload 预加载关联的 Thread 对象，避免额外的查询
-                selected_resource = await resource_repo.get_with_thread(
-                    session, id=selected_resource_id
-                )
-
-            if not selected_resource:
+            resource = await _load_resource(int(self.values[0]))
+            if resource is None:
                 await interaction.response.send_message(
-                    "错误：找不到所选的资源，它可能已被删除。", ephemeral=True
+                    "❌ 找不到所选资源，它可能已被删除。", ephemeral=True
                 )
                 return
 
-            # # --- 反应墙验证 ---
-            # thread = selected_resource.thread
-            # if thread.reaction_required:
-            #     # 获取当前帖子（即 interaction.channel）
-            #     if not isinstance(interaction.channel, discord.Thread):
-            #         # 这不应该发生，因为 /下载 命令只在帖子中可用
-            #         await interaction.response.send_message(
-            #             "❌ 错误：无法验证反应，因为当前频道不是帖子。", ephemeral=True
-            #         )
-            #         return
-            #     discord_thread = interaction.channel
-            #     # 获取起始消息
-            #     try:
-            #         # 强制从 API 获取最新的消息状态，避免缓存问题
-            #         # 帖子的 ID 和它的起始消息的 ID 是相同的
-            #         starter_message = await discord_thread.fetch_message(
-            #             discord_thread.id
-            #         )
-            #     except (discord.NotFound, discord.Forbidden, Exception) as e:
-            #         logger.error(f"获取帖子起始消息失败: {e}")
-            #         await interaction.response.send_message(
-            #             "❌ 无法验证您的反应，请稍后再试。", ephemeral=True
-            #         )
-            #         return
-            #
-            #     # 检查用户是否已做出反应
-            #     user_has_reacted = False
-            #     if thread.reaction_emoji:
-            #         # 检查特定表情
-            #         for reaction in starter_message.reactions:
-            #             if str(reaction.emoji) == thread.reaction_emoji:
-            #                 # 检查该用户是否已做出反应
-            #                 try:
-            #                     users = [
-            #                         user
-            #                         async for user in reaction.users()
-            #                         if user.id == interaction.user.id
-            #                     ]
-            #                     if users:
-            #                         user_has_reacted = True
-            #                         break
-            #                 except discord.Forbidden:
-            #                     pass
-            #     else:
-            #         # 检查任何反应
-            #         for reaction in starter_message.reactions:
-            #             try:
-            #                 users = [
-            #                     user
-            #                     async for user in reaction.users()
-            #                     if user.id == interaction.user.id
-            #                 ]
-            #                 if users:
-            #                     user_has_reacted = True
-            #                     break
-            #             except discord.Forbidden:
-            #                 pass
-            #
-            #     if not user_has_reacted:
-            #         emoji_info = (
-            #             f" {thread.reaction_emoji}"
-            #             if thread.reaction_emoji
-            #             else "任意表情"
-            #         )
-            #         await interaction.response.send_message(
-            #             f"❌ 您需要先对本帖的起始消息做出反应[{emoji_info}]才能下载此资源。",
-            #             ephemeral=True,
-            #         )
-            #         return
-
-            # --- 核心修复：动态获取新的有效链接 ---
-            fresh_url = None
-            try:
-                # 断言 bot 实例存在
-                assert isinstance(interaction.client, discord.Client)
-                bot = interaction.client
-
-                # 确定源消息所在的频道 ID
-                # 如果是受保护文件，warehouse_thread_id 存在；否则用 public_thread_id
-                channel_id = (
-                    selected_resource.thread.warehouse_thread_id
-                    or selected_resource.thread.public_thread_id
-                )
-                source_channel = await bot.fetch_channel(channel_id)
-
-                # 断言是可获取消息的频道类型
-                assert isinstance(source_channel, (discord.TextChannel, discord.Thread))
-                source_message = await source_channel.fetch_message(
-                    selected_resource.source_message_id
-                )
-
-                if source_message and source_message.attachments:
-                    fresh_url = source_message.attachments[0].url
-                else:
-                    raise ValueError("源消息或附件未找到")
-
-            except Exception as e:
-                logger.error(
-                    f"为资源 {selected_resource_id} 获取新下载链接失败", exc_info=e
+            if resource.trace_enabled:
+                embed = discord.Embed(
+                    title="🛡️ 动态溯源告知",
+                    description=(
+                        "作者已为这个作品开启动态溯源。下载时，Bot 会在副本中写入"
+                        "经过加密、并绑定本作品的溯源凭证。\n\n"
+                        "凭证不包含明文 Discord ID；系统不会监控或读取你本地的文件。"
+                        "只有发现作品已在外部泄露后，管理组才会对具体样本进行受控核验。\n\n"
+                        "如果你不接受，请点击取消并不要下载。"
+                    ),
+                    color=discord.Color.orange(),
                 )
                 await interaction.response.send_message(
-                    "❌ 抱歉，获取下载链接时发生错误。源文件可能已被删除或Bot无法访问。",
+                    embed=embed,
+                    view=TraceConsentView(
+                        resource_id=resource.id,
+                        user_id=interaction.user.id,
+                        password_required=bool(resource.password),
+                    ),
                     ephemeral=True,
                 )
                 return
-            # --- 链接获取结束 ---
 
-            # --- 下载计数 ---
-            try:
-                selected_resource.download_count += 1
-                session.add(selected_resource)
-                await session.commit()
-                logger.info(
-                    f"资源 {selected_resource.id} 的下载计数已增加至 {selected_resource.download_count}"
+            if resource.password:
+                await interaction.response.send_modal(
+                    PasswordModal(resource_id=resource.id, trace_confirmed=False)
                 )
-            except Exception as e:
-                await session.rollback()
-                logger.error(
-                    f"为资源 {selected_resource.id} 增加下载计数失败", exc_info=e
-                )
-            # --- 下载计数结束 ---
+                return
+            await deliver_resource(interaction, resource_id=resource.id)
 
-            if selected_resource.password:
-                modal = PasswordModal(resource=selected_resource, fresh_url=fresh_url)
-                # 修复：直接响应模态框，这是此代码路径的第一次也是唯一一次响应。
-                await interaction.response.send_modal(modal)
 
-            else:
-                response_embed = discord.Embed(
-                    title="🔗 下载链接",
-                    description=f"您选择的资源下载链接如下请尽快下载：\n\n[点击这里下载]({fresh_url})",
-                    color=discord.Color.green(),
-                )
-                # 修复：直接发送消息作为响应。
-                await interaction.response.send_message(
-                    embed=response_embed, ephemeral=True
-                )
+class TraceConsentView(discord.ui.View):
+    def __init__(
+        self, *, resource_id: int, user_id: int, password_required: bool
+    ) -> None:
+        super().__init__(timeout=180)
+        self.resource_id = resource_id
+        self.user_id = user_id
+        self.password_required = password_required
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "❌ 这个确认面板不属于你。", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="同意并继续", style=discord.ButtonStyle.success)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if self.password_required:
+            await interaction.response.send_modal(
+                PasswordModal(resource_id=self.resource_id, trace_confirmed=True)
+            )
+            return
+        await deliver_resource(
+            interaction,
+            resource_id=self.resource_id,
+            trace_confirmed=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            content="已取消下载。", embed=None, view=None
+        )
+        self.stop()
 
 
 class PasswordModal(discord.ui.Modal, title="请输入下载密码"):
-    """一个用于在下载前验证密码的弹出式模态框。"""
-
-    def __init__(self, resource: Resource, fresh_url: str):
-        super().__init__(timeout=180)  # 3分钟超时
-        self.resource = resource
-        self.fresh_url = fresh_url  # 存储新鲜的URL
-
+    def __init__(self, *, resource_id: int, trace_confirmed: bool):
+        super().__init__(timeout=180)
+        self.resource_id = resource_id
+        self.trace_confirmed = trace_confirmed
         self.password_input = discord.ui.TextInput(
             label="密码",
             style=discord.TextStyle.short,
@@ -238,18 +285,24 @@ class PasswordModal(discord.ui.Modal, title="请输入下载密码"):
         self.add_item(self.password_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        """当用户提交密码后，验证密码并提供下载链接或错误信息。"""
-        if self.password_input.value == self.resource.password:
-            embed = discord.Embed(
-                title="✅ 密码正确",
-                description=f"下载链接如下，请尽快下载：\n\n[点击这里下载]({self.fresh_url})",
-                color=discord.Color.green(),
+        resource = await _load_resource(self.resource_id)
+        if resource is None:
+            await interaction.response.send_message(
+                "❌ 找不到所选资源，它可能已被删除。", ephemeral=True
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        else:
-            embed = discord.Embed(
-                title="❌ 密码错误",
-                description="您输入的密码不正确，请重试。",
-                color=discord.Color.red(),
+            return
+        if self.password_input.value != resource.password:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="❌ 密码错误",
+                    description="你输入的密码不正确，请重试。",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        await deliver_resource(
+            interaction,
+            resource_id=resource.id,
+            trace_confirmed=self.trace_confirmed,
+        )

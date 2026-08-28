@@ -2,6 +2,7 @@ import datetime
 import enum
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -71,6 +72,9 @@ class Resource(Base):
     filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     download_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    trace_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
 
     # --- 关系 ---
     # 多个 Resource 属于一个 Thread

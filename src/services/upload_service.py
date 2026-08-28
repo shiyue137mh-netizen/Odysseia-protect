@@ -4,6 +4,7 @@
 """
 
 import logging
+import io
 from typing import Any, Optional, Union
 
 import discord
@@ -130,6 +131,7 @@ class UploadService(BaseService):
         mode: str,
         version_info: str,
         password: Optional[str],
+        trace_enabled: bool = False,
         file: Optional[discord.Attachment] = None,
         message_link: Optional[str] = None,
     ) -> str:
@@ -162,6 +164,7 @@ class UploadService(BaseService):
                     file=file,
                     version_info=version_info,
                     password=password,
+                    trace_enabled=trace_enabled,
                 )
             else:
                 # 断言 message_link 存在
@@ -287,10 +290,24 @@ class UploadService(BaseService):
         file: discord.Attachment,
         version_info: Optional[str],
         password: Optional[str],
+        trace_enabled: bool,
     ) -> str:
         """处理受保护文件的上传逻辑，文件将被上传到私密的论坛帖子中。"""
         assert isinstance(interaction.channel, (discord.TextChannel, discord.Thread))
         try:
+            if trace_enabled:
+                if not self.bot.traceability_service.available:
+                    raise ValueError("服务器尚未配置动态溯源密钥，暂时无法开启溯源。")
+                source_data = await file.read()
+                self.bot.traceability_service.validate_character_card(
+                    file.filename, source_data
+                )
+                upload_file = discord.File(
+                    io.BytesIO(source_data), filename=file.filename
+                )
+            else:
+                upload_file = await file.to_file()
+
             # 1. 获取或创建当前公开帖子的数据库记录
             thread_model = await self._get_or_create_thread(
                 session, interaction=interaction
@@ -302,7 +319,7 @@ class UploadService(BaseService):
             )
 
             # 3. 将文件上传到仓库帖子
-            message = await warehouse_thread.send(file=await file.to_file())
+            message = await warehouse_thread.send(file=upload_file)
 
             # 4. 在数据库中创建资源记录
             resource_data = ResourceCreate(
@@ -312,11 +329,16 @@ class UploadService(BaseService):
                 version_info=version_info or "未提供",
                 source_message_id=message.id,
                 password=password,
+                trace_enabled=trace_enabled,
             )
             await self.resource_repo.create(session, obj_in=resource_data)
 
             logger.info(f"受保护文件上传成功: {file.filename} -> {warehouse_thread.id}")
-            return f"✅ 受保护文件上传成功！文件 `{file.filename}` 已被安全存储。"
+            trace_note = "并已开启动态溯源。" if trace_enabled else ""
+            return (
+                f"✅ 受保护文件上传成功！文件 `{file.filename}` 已被安全存储。"
+                f"{trace_note}"
+            )
         except (ValueError, IOError, discord.HTTPException) as e:
             logger.error(f"处理受保护文件上传时失败: {e}")
             return f"❌ 错误: {e}"
@@ -329,6 +351,7 @@ class UploadService(BaseService):
         attachments: list[discord.Attachment],
         version_info: str,
         password: Optional[str],
+        trace_enabled: bool = False,
         source_message: Optional[discord.Message] = None,
     ) -> str:
         """处理来自多附件上传模态框的提交。"""
@@ -343,6 +366,7 @@ class UploadService(BaseService):
                     attachments=attachments,
                     version_info=version_info,
                     password=password,
+                    trace_enabled=trace_enabled,
                     thread_model=thread_model,
                 )
             )
@@ -409,6 +433,7 @@ class UploadService(BaseService):
         attachments: list[discord.Attachment],
         version_info: str,
         password: Optional[str],
+        trace_enabled: bool,
         thread_model,
     ) -> str:
         """处理多个附件的安全上传的后端逻辑。"""
@@ -418,6 +443,19 @@ class UploadService(BaseService):
         if thread_model.author_id != interaction.user.id:
             raise PermissionError("抱歉，只有本帖的作者才能上传资源。")
 
+        prepared_attachments: list[tuple[discord.Attachment, bytes | None]] = []
+        if trace_enabled:
+            if not self.bot.traceability_service.available:
+                raise ValueError("服务器尚未配置动态溯源密钥，暂时无法开启溯源。")
+            for attachment in attachments:
+                source_data = await attachment.read()
+                self.bot.traceability_service.validate_character_card(
+                    attachment.filename, source_data
+                )
+                prepared_attachments.append((attachment, source_data))
+        else:
+            prepared_attachments = [(attachment, None) for attachment in attachments]
+
         # 2. 统一调用函数来查找或创建仓库帖子
         warehouse_thread = await self._find_or_create_warehouse_thread(
             session, interaction, thread_model
@@ -425,9 +463,14 @@ class UploadService(BaseService):
 
         # 3. 上传所有附件并创建资源记录
         uploaded_files = []
-        for attachment in attachments:
+        for attachment, source_data in prepared_attachments:
             try:
-                message = await warehouse_thread.send(file=await attachment.to_file())
+                upload_file = (
+                    discord.File(io.BytesIO(source_data), filename=attachment.filename)
+                    if source_data is not None
+                    else await attachment.to_file()
+                )
+                message = await warehouse_thread.send(file=upload_file)
                 resource_data = ResourceCreate(
                     thread_id=thread_model.id,
                     upload_mode=UploadMode.SECURE,
@@ -435,6 +478,7 @@ class UploadService(BaseService):
                     version_info=version_info,
                     source_message_id=message.id,
                     password=password,
+                    trace_enabled=trace_enabled,
                 )
                 await self.resource_repo.create(session, obj_in=resource_data)
                 uploaded_files.append(attachment.filename)

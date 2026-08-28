@@ -80,8 +80,12 @@ src/
    ```env
    DISCORD_BOT_TOKEN=your_bot_token_here
    WAREHOUSE_CHANNEL_ID=your_warehouse_forum_channel_id
+   ODYSSEIA_TRACE_KEY=your_32_byte_base64url_key
+   ODYSSEIA_TRACE_KEY_ID=v1
    TEST_GUILD_ID=your_test_guild_id
    ```
+
+   可使用 `uv run python -m Watermark.watermark keygen` 生成溯源密钥。
 
 4. **运行 Bot**
 - windows 部署
@@ -200,6 +204,8 @@ pytest
 | ---------------------- | ----------------- | ------------ |
 | `DISCORD_BOT_TOKEN`    | Discord Bot Token | `MTE...`     |
 | `WAREHOUSE_CHANNEL_ID` | 仓库论坛频道 ID   | `1234567890` |
+| `ODYSSEIA_TRACE_KEY`   | 可选，动态溯源 AES-256-GCM Base64URL 密钥 | `...` |
+| `ODYSSEIA_TRACE_KEY_ID` | 可选，溯源密钥版本；必须与密钥同时配置 | `v1` |
 | `TEST_GUILD_ID`        | 测试服务器 ID     | `9876543210` |
 
 ### 配置文件

@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _trace_enabled(value: str) -> bool:
+    return value.strip().casefold() in {"开启", "是", "yes", "true", "1"}
+
+
 class PrivacyPolicyView(discord.ui.View):
     """一个包含同意和拒绝隐私协议按钮的视图。"""
 
@@ -153,8 +157,16 @@ class SecureUploadModal(discord.ui.Modal, title="上传受保护文件 - 填写�
             required=False,
             max_length=50,
         )
+        self.trace_input = discord.ui.TextInput(
+            label="动态溯源 (输入“开启”，留空则关闭)",
+            placeholder="开启后，下载者会被告知并获得个性化角色卡",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=10,
+        )
         self.add_item(self.version_info_input)
         self.add_item(self.password_input)
+        self.add_item(self.trace_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         """当用户提交模态框时，调用服务层完成上传流程。"""
@@ -171,6 +183,7 @@ class SecureUploadModal(discord.ui.Modal, title="上传受保护文件 - 填写�
                         attachments=self.files,
                         version_info=self.version_info_input.value,
                         password=self.password_input.value or None,
+                        trace_enabled=_trace_enabled(self.trace_input.value),
                         source_message=self.source_message,
                     )
                 )
@@ -183,5 +196,6 @@ class SecureUploadModal(discord.ui.Modal, title="上传受保护文件 - 填写�
                     file=self.files,
                     version_info=self.version_info_input.value,
                     password=self.password_input.value or None,
+                    trace_enabled=_trace_enabled(self.trace_input.value),
                 )
         await interaction.edit_original_response(content=result_message)

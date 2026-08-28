@@ -70,6 +70,7 @@ class ResourceBase(BaseModel):
     source_message_id: int
     description: Optional[str] = None
     password: Optional[str] = None
+    trace_enabled: bool = False
 
 
 class ResourceCreate(ResourceBase):
@@ -80,6 +81,7 @@ class ResourceUpdate(BaseModel):
     version_info: Optional[str] = None
     description: Optional[str] = None
     password: Optional[str] = None
+    trace_enabled: Optional[bool] = None
 
 
 class ResourceInDB(ResourceBase):
